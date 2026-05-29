@@ -1,0 +1,9 @@
+dash==2.18.2
+dash-bootstrap-components==1.6.0
+plotly==5.22.0
+pandas==2.2.2
+geopandas==1.0.1
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.30
+scikit-learn==1.5.0
+gunicorn==22.0.0
