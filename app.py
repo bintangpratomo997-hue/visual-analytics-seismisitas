@@ -818,7 +818,7 @@ def update_peta(tahun_range, filter_mag, filter_ked, layers):
     Input("btn-cluster",      "n_clicks"), # tombol 'Jalankan' sebagai trigger
     State("kluster-eps",          "value"),          # nilai ε (km)
     State("kluster-min-samples",  "value"),          # nilai min_samples
-    prevent_initial_call=False   # tetap jalankan saat halaman pertama dibuka
+    prevent_initial_call=True    # hanya jalankan saat tombol "Jalankan" diklik
 )
 def update_kluster(n_clicks, eps_km, min_samp):
     """
