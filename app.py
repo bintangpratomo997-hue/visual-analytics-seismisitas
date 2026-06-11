@@ -1,10 +1,4 @@
 """
-Dashboard Visual Analytics Seismisitas Indonesia
-=================================================
-Skripsi: Perancangan Sistem Visual Analytics untuk Analisis Seismisitas
-         Indonesia dengan Metode Clustering Spasial
-Peneliti: Sri Bintang Pratomo (825220070) — UNTAR Prodi SI
-
 Struktur:
     app.py  ← file utama (jalankan ini)
 
@@ -18,39 +12,61 @@ Dependensi:
                geopandas psycopg2-binary scikit-learn sqlalchemy
 """
 
+# ─────────────────────────────────────────────
+# IMPOR LIBRARY
+# ─────────────────────────────────────────────
+import os  # untuk membaca environment variable (DATABASE_URL di Render)
+# Pandas & NumPy: manipulasi dan komputasi data tabular
 import pandas as pd
-import geopandas as gpd
+import geopandas as gpd   # Pandas versi geospasial — membaca shapefile/GeoJSON
 import numpy as np
 import json
+# psycopg2 / SQLAlchemy: driver & ORM untuk koneksi ke PostgreSQL
 import psycopg2
 from sqlalchemy import create_engine
 
+# Dash: framework web interaktif berbasis Python (tidak perlu menulis JS)
 import dash
 from dash import dcc, html, Input, Output, State, dash_table
-import dash_bootstrap_components as dbc
+import dash_bootstrap_components as dbc   # Komponen UI bergaya Bootstrap
+# Plotly: membuat grafik interaktif (bar, pie, map, scatter, heatmap)
 import plotly.express as px
 import plotly.graph_objects as go
+# Scikit-learn: algoritma DBSCAN dan metrik evaluasi kluster
 from sklearn.cluster import DBSCAN
 from sklearn.metrics import silhouette_score, davies_bouldin_score
 
 # ─────────────────────────────────────────────
 # KONFIGURASI
 # ─────────────────────────────────────────────
+# Deteksi environment:
+#   - Render/cloud → gunakan DATABASE_URL environment variable (lebih prioritas)
+#   - Lokal        → gunakan DB_CONFIG atau CSV jika DB tidak tersedia
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# Kredensial koneksi database PostgreSQL lokal
+# (hanya digunakan jika DATABASE_URL tidak diset)
 DB_CONFIG = {
-    "host"    : "db.caqlmbjaqfgrqbjznudn.supabase.co",
+    "host"    : "localhost",
     "port"    : 5432,
-    "dbname"  : "postgres",
+    "dbname"  : "seismisitas_db",
     "user"    : "postgres",
-    "password": "Seismisitas2026",
+    "password": "black007",
 }
+# Path file GeoJSON patahan aktif dari Geoportal ESDM
 GEOJSON_PATH = "Patahan Aktif geoportal.esdm.go.id.geojson"
+# Path CSV dataset gempa (fallback jika tidak ada koneksi DB)
+CSV_PATH = "bmkg_gempa_indonesia_Ja2000_Fe2026.csv"
+# Gaya peta dasar — open-street-map tidak memerlukan token API
 MAPBOX_STYLE = "open-street-map"
 
 # Parameter DBSCAN final dari skripsi
+# eps: jarak maksimum antar titik agar dianggap bertetangga (200 km → meter)
 EPS_DEFAULT        = 200_000   # 200 km dalam meter
+# min_samples: minimum titik dalam radius eps untuk membentuk inti kluster
 MIN_SAMPLES_DEFAULT = 1000
 
-# Warna kluster (color-blind safe palette)
+# Palet warna untuk kluster — dipilih ramah buta warna (Wong color-blind palette)
 WARNA_KLUSTER = [
     "#E69F00", "#56B4E9", "#009E73",
     "#F0E442", "#0072B2", "#D55E00", "#CC79A7"
@@ -60,6 +76,17 @@ WARNA_KLUSTER = [
 # KONEKSI DATABASE
 # ─────────────────────────────────────────────
 def get_engine():
+    """
+    Membuat SQLAlchemy engine untuk koneksi ke PostgreSQL.
+    Urutan prioritas:
+      1. DATABASE_URL environment variable → digunakan di Render/cloud
+      2. DB_CONFIG lokal → digunakan saat development di localhost
+    """
+    if DATABASE_URL:
+        # Render menyediakan URL dalam format postgresql://, SQLAlchemy 2.x
+        # memerlukan postgresql+psycopg2://
+        url = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+        return create_engine(url)
     cfg = DB_CONFIG
     return create_engine(
         f"postgresql+psycopg2://{cfg['user']}:{cfg['password']}"
@@ -69,54 +96,110 @@ def get_engine():
 # ─────────────────────────────────────────────
 # LOAD DATA (cache di memori)
 # ─────────────────────────────────────────────
-print("Memuat data dari PostgreSQL...")
-engine = get_engine()
+# Data dimuat sekali saat aplikasi pertama dijalankan dan disimpan di RAM.
+# Pendekatan ini menghindari query berulang ke database setiap ada interaksi.
 
-df_gempa = pd.read_sql("""
-    SELECT
-        f.id_fakta,
-        w.tgl, w.ot, w.tahun, w.bulan,
-        l.lat, l.lon, l.provinsi, l.remark,
-        f.nilai_magnitude, f.nilai_kedalaman,
-        f.jarak_patahan_km, f.dekat_patahan,
-        m.kategori_magnitude,
-        k.kategori_kedalaman,
-        f.id_kluster,
-        kl.label_kluster
-    FROM fact_gempa f
-    JOIN dim_waktu     w  ON f.id_waktu    = w.id_waktu
-    JOIN dim_lokasi    l  ON f.id_lokasi   = l.id_lokasi
-    JOIN dim_magnitude m  ON f.id_magnitude = m.id_magnitude
-    JOIN dim_kedalaman k  ON f.id_kedalaman = k.id_kedalaman
-    LEFT JOIN dim_kluster kl ON f.id_kluster = kl.id_kluster
-""", engine)
+def _load_from_csv():
+    """
+    Fallback: baca dataset langsung dari file CSV (tanpa PostgreSQL).
+    Kolom di CSV menggunakan nama asli BMKG ('mag', 'depth'), sedangkan
+    kode callback mengharapkan nama dari star schema ('nilai_magnitude',
+    'nilai_kedalaman'). Fungsi ini menangani pemetaan tersebut dan
+    menambahkan kolom placeholder untuk kolom yang tidak ada di CSV.
+    """
+    print("  [CSV] Memuat dari file CSV...")
+    df = pd.read_csv(CSV_PATH)
+    # Normalisasi nama kolom agar sesuai dengan yang diharapkan callback
+    df = df.rename(columns={
+        "mag"  : "nilai_magnitude",
+        "depth": "nilai_kedalaman"
+    })
+    # Kolom dari star schema yang tidak ada di CSV → diisi nilai default
+    df["jarak_patahan_km"] = np.nan
+    df["dekat_patahan"]    = False
+    df["id_kluster"]       = None
+    df["label_kluster"]    = None
+    df["id_fakta"]         = range(len(df))
+    return df
 
-df_kluster = pd.read_sql(
-    "SELECT * FROM dim_kluster ORDER BY id_kluster", engine
-)
+# ── Inisialisasi: coba PostgreSQL dulu, fallback ke CSV ─────────────────────
+print("Memuat data...")
+df_gempa   = None
+df_kluster = pd.DataFrame(columns=["id_kluster", "label_kluster"])
 
-# Load GeoJSON patahan aktif
+if DATABASE_URL:
+    # Mode cloud (Render): DATABASE_URL diset sebagai env var
+    try:
+        engine   = get_engine()
+        # ┌─────────────────────────────────────────────────────────────┐
+        # │  SUMBER DATA UTAMA — Star Schema Join                       │
+        # │  Tabel: FACT_GEMPA (tabel pusat)                            │
+        # │    JOIN  DIM_WAKTU      → tgl, ot, tahun, bulan             │
+        # │    JOIN  DIM_LOKASI     → lat, lon, provinsi, remark        │
+        # │    JOIN  DIM_MAGNITUDE  → kategori_magnitude                │
+        # │    JOIN  DIM_KEDALAMAN  → kategori_kedalaman                │
+        # │    LEFT JOIN DIM_KLUSTER → label_kluster (nullable)         │
+        # │  Sumber GeoJSON: PSG/Badan Geologi ESDM (patahan aktif)     │
+        # └─────────────────────────────────────────────────────────────┘
+        df_gempa = pd.read_sql("""
+            SELECT
+                f.id_fakta,
+                w.tgl, w.ot, w.tahun, w.bulan,
+                l.lat, l.lon, l.provinsi, l.remark,
+                f.nilai_magnitude, f.nilai_kedalaman,
+                f.jarak_patahan_km, f.dekat_patahan,
+                m.kategori_magnitude,
+                k.kategori_kedalaman,
+                f.id_kluster,
+                kl.label_kluster
+            FROM fact_gempa f
+            JOIN dim_waktu     w  ON f.id_waktu    = w.id_waktu
+            JOIN dim_lokasi    l  ON f.id_lokasi   = l.id_lokasi
+            JOIN dim_magnitude m  ON f.id_magnitude = m.id_magnitude
+            JOIN dim_kedalaman k  ON f.id_kedalaman = k.id_kedalaman
+            LEFT JOIN dim_kluster kl ON f.id_kluster = kl.id_kluster
+        """, engine)
+        df_kluster = pd.read_sql(
+            "SELECT * FROM dim_kluster ORDER BY id_kluster", engine
+        )
+        print(f"  [DB] Data gempa  : {len(df_gempa):,} baris")
+        print(f"  [DB] Kluster     : {len(df_kluster)} kluster")
+    except Exception as e:
+        print(f"  [WARN] Koneksi DB gagal: {e}")
+        df_gempa = None
+
+if df_gempa is None:
+    # Mode lokal atau fallback: muat dari CSV
+    df_gempa = _load_from_csv()
+    print(f"  [CSV] Data gempa : {len(df_gempa):,} baris")
+
+# Membaca GeoJSON patahan aktif, lalu filter hanya segmen berkelas "Aktif"
 gdf_patahan = gpd.read_file(GEOJSON_PATH)
 gdf_aktif   = gdf_patahan[gdf_patahan["klspthn"] == "Aktif"].copy()
 
-print(f"  Data gempa   : {len(df_gempa):,} baris")
-print(f"  Kluster      : {len(df_kluster)} kluster")
 print(f"  Patahan aktif: {len(gdf_aktif)} segmen")
+print("Data siap.\n")
 
 # ─────────────────────────────────────────────
 # INISIALISASI APP
 # ─────────────────────────────────────────────
+# Membuat instance aplikasi Dash.
+# suppress_callback_exceptions=True diperlukan karena komponen halaman
+# dibuat secara dinamis (multi-page routing) sehingga belum ada saat startup.
 app = dash.Dash(
     __name__,
     external_stylesheets=[dbc.themes.BOOTSTRAP],
     suppress_callback_exceptions=True,
     title="Visual Analytics Seismisitas Indonesia"
 )
+# server di-expose agar kompatibel dengan deployment WSGI (Gunicorn/uWSGI)
 server = app.server
 
 # ─────────────────────────────────────────────
 # KOMPONEN NAVBAR
 # ─────────────────────────────────────────────
+# Navbar tetap di bagian atas (sticky="top") dengan tautan navigasi
+# ke tiga halaman utama dashboard.
 navbar = dbc.Navbar(
     dbc.Container([
         html.A(
@@ -141,6 +224,9 @@ navbar = dbc.Navbar(
 # ─────────────────────────────────────────────
 # LAYOUT UTAMA
 # ─────────────────────────────────────────────
+# Kerangka halaman global.
+# dcc.Location melacak URL browser → callback routing memilih halaman yang ditampilkan.
+# html.Div id="page-content" adalah slot tempat konten setiap halaman disisipkan.
 app.layout = html.Div([
     dcc.Location(id="url"),
     navbar,
@@ -161,20 +247,51 @@ app.layout = html.Div([
 # HALAMAN 1: IKHTISAR
 # ═════════════════════════════════════════════
 def layout_ikhtisar():
+    """
+    Membangun layout halaman Ikhtisar yang memuat:
+    - 4 kartu KPI (Key Performance Indicator) ringkasan data
+    - Slider filter rentang tahun
+    - Grafik tren kejadian per tahun (bar chart)
+    - Distribusi kategori magnitudo (donut pie chart)
+    - Tabel 5 provinsi dengan gempa terbanyak
+
+    Nilai KPI dihitung dari seluruh dataset (sebelum filtering),
+    sedangkan grafik & tabel diperbarui secara reaktif oleh callback.
+    """
     tahun_min = int(df_gempa["tahun"].min())
     tahun_max = int(df_gempa["tahun"].max())
 
-    # Hitung KPI
+    # ── Hitung KPI statis (ditampilkan di kartu atas) ──────────────────────
+
+    # KPI 1 — Total Kejadian
+    # Sumber : FACT_GEMPA (COUNT semua baris)
+    # Kolom  : id_fakta
     total        = len(df_gempa)
+
+    # KPI 2 — Rata-rata Magnitudo
+    # Sumber : FACT_GEMPA
+    # Kolom  : nilai_magnitude
     rata_mag     = df_gempa["nilai_magnitude"].mean()
+
+    # KPI 3 — Provinsi Paling Aktif
+    # Sumber : FACT_GEMPA JOIN DIM_LOKASI
+    # Kolom  : DIM_LOKASI.provinsi → value_counts() → ambil index[0]
     prov_aktif   = df_gempa["provinsi"].value_counts().index[0]
+
+    # KPI 4 — Persentase Gempa Dangkal
+    # Sumber : FACT_GEMPA JOIN DIM_KEDALAMAN
+    # Kolom  : DIM_KEDALAMAN.kategori_kedalaman == "Dangkal"
     pct_dangkal  = (df_gempa["kategori_kedalaman"] == "Dangkal").mean() * 100
 
     return dbc.Container([
         html.H4("📊 Ikhtisar Seismisitas Indonesia",
                 className="my-3 fw-bold text-dark"),
 
-        # ── Kartu KPI ──────────────────────────────────────
+        # ── Kartu KPI — empat metrik ringkas ────────────────────────────────
+        # KPI 1: FACT_GEMPA (COUNT id_fakta)
+        # KPI 2: FACT_GEMPA (AVG nilai_magnitude)
+        # KPI 3: FACT_GEMPA JOIN DIM_LOKASI (MAX COUNT provinsi)
+        # KPI 4: FACT_GEMPA JOIN DIM_KEDALAMAN (% kategori_kedalaman = Dangkal)
         dbc.Row([
             dbc.Col(_kpi_card("Total Kejadian",      f"{total:,}",          "gempa (2000–2026)", "primary"), md=3),
             dbc.Col(_kpi_card("Rata-rata Magnitudo", f"{rata_mag:.2f} M",   "skala Richter",     "warning"), md=3),
@@ -182,10 +299,12 @@ def layout_ikhtisar():
             dbc.Col(_kpi_card("Gempa Dangkal",       f"{pct_dangkal:.1f}%", "kedalaman 0–70 km", "success"), md=3),
         ], className="mb-4"),
 
-        # ── Filter Tahun ───────────────────────────────────
+        # ── Filter Tahun — mengontrol semua grafik di bawahnya ──────────────
         dbc.Card([
             dbc.CardBody([
                 html.Label("Filter Rentang Tahun:", className="fw-semibold"),
+                # RangeSlider menghasilkan list [tahun_awal, tahun_akhir]
+                # yang menjadi input callback update_ikhtisar()
                 dcc.RangeSlider(
                     id="slider-tahun",
                     min=tahun_min, max=tahun_max,
@@ -196,7 +315,11 @@ def layout_ikhtisar():
             ])
         ], className="mb-4"),
 
-        # ── Grafik Tren + Pie Chart ────────────────────────
+        # ── Grafik Tren (kiri) + Pie Chart (kanan) — lebar 8:4 kolom ────────
+        # Tren Tahunan : FACT_GEMPA JOIN DIM_WAKTU
+        #                GROUP BY DIM_WAKTU.tahun → COUNT(*)
+        # Pie Chart    : FACT_GEMPA JOIN DIM_MAGNITUDE
+        #                GROUP BY DIM_MAGNITUDE.kategori_magnitude → COUNT(*)
         dbc.Row([
             dbc.Col([
                 dbc.Card([
@@ -212,7 +335,9 @@ def layout_ikhtisar():
             ], md=4),
         ], className="mb-4"),
 
-        # ── Tabel 5 Provinsi Teratas ───────────────────────
+        # ── Tabel 5 Provinsi Teratas ─────────────────────────────────────────
+        # Sumber : FACT_GEMPA JOIN DIM_LOKASI
+        # Kolom  : DIM_LOKASI.provinsi → value_counts().head(5)
         dbc.Card([
             dbc.CardHeader("🏆 Lima Provinsi dengan Kejadian Gempa Terbanyak"),
             dbc.CardBody(html.Div(id="tabel-provinsi"))
@@ -222,6 +347,11 @@ def layout_ikhtisar():
 
 
 def _kpi_card(judul, nilai, sub, warna):
+    """
+    Helper untuk membuat kartu KPI seragam.
+    judul: label metrik  |  nilai: angka utama  |  sub: keterangan kecil
+    warna: kelas Bootstrap ('primary', 'warning', dst.)
+    """
     return dbc.Card([
         dbc.CardBody([
             html.H6(judul, className="text-muted small mb-1"),
@@ -235,9 +365,20 @@ def _kpi_card(judul, nilai, sub, warna):
 # HALAMAN 2: PETA INTERAKTIF
 # ═════════════════════════════════════════════
 def layout_peta():
+    """
+    Membangun layout halaman Peta Interaktif dengan:
+    - Panel filter (tahun, magnitudo, kedalaman, layer) di kiri
+    - Peta Mapbox full-height di kanan
+
+    Tiga layer yang dapat diaktifkan:
+      1. Episenter — titik lokasi gempa, warna berdasarkan kedalaman
+      2. Patahan Aktif — garis patahan dari GeoJSON ESDM
+      3. Heatmap KDE — visualisasi densitas episenter
+    """
     tahun_min = int(df_gempa["tahun"].min())
     tahun_max = int(df_gempa["tahun"].max())
 
+    # Ambil nilai unik kategori untuk opsi filter checklist
     kat_mag = sorted(df_gempa["kategori_magnitude"].unique())
     kat_ked = sorted(df_gempa["kategori_kedalaman"].unique())
 
@@ -246,12 +387,13 @@ def layout_peta():
                 className="my-3 fw-bold text-dark"),
 
         dbc.Row([
-            # ── Panel Filter ──────────────────────────────
+            # ── Panel Filter kiri (lebar 2 kolom Bootstrap) ─────────────────
             dbc.Col([
                 dbc.Card([
                     dbc.CardHeader("⚙️ Filter Data"),
                     dbc.CardBody([
                         html.Label("Rentang Tahun:", className="fw-semibold small"),
+                        # Default ditampilkan: 5 tahun terakhir
                         dcc.RangeSlider(
                             id="peta-slider-tahun",
                             min=tahun_min, max=tahun_max,
@@ -261,6 +403,7 @@ def layout_peta():
                         ),
                         html.Hr(),
                         html.Label("Kategori Magnitudo:", className="fw-semibold small"),
+                        # Default: hanya gempa sedang ke atas untuk performa peta
                         dcc.Checklist(
                             id="peta-filter-mag",
                             options=[{"label": f" {k}", "value": k} for k in kat_mag],
@@ -272,11 +415,12 @@ def layout_peta():
                         dcc.Checklist(
                             id="peta-filter-ked",
                             options=[{"label": f" {k}", "value": k} for k in kat_ked],
-                            value=kat_ked,
+                            value=kat_ked,   # default: semua kedalaman diaktifkan
                             labelStyle={"display": "block", "fontSize": "0.85rem"}
                         ),
                         html.Hr(),
                         html.Label("Layer Tampilan:", className="fw-semibold small"),
+                        # Pilihan layer yang dapat dikombinasikan secara bebas
                         dcc.Checklist(
                             id="peta-layer",
                             options=[
@@ -284,23 +428,24 @@ def layout_peta():
                                 {"label": " Patahan Aktif",    "value": "patahan"},
                                 {"label": " Heatmap KDE",      "value": "kde"},
                             ],
-                            value=["episenter"],
+                            value=["episenter"],   # default: hanya episenter
                             labelStyle={"display": "block", "fontSize": "0.85rem"}
                         ),
                         html.Hr(),
+                        # Info teks dinamis: menampilkan jumlah titik yang terlihat
                         html.Div(id="peta-info", className="text-muted small")
                     ])
                 ], className="sticky-top", style={"top": "70px"})
             ], md=2),
 
-            # ── Peta ──────────────────────────────────────
+            # ── Peta Mapbox (lebar 10 kolom Bootstrap) ──────────────────────
             dbc.Col([
                 dbc.Card([
                     dbc.CardBody(
                         dcc.Graph(
                             id="peta-map",
                             style={"height": "75vh"},
-                            config={"scrollZoom": True}
+                            config={"scrollZoom": True}   # aktifkan zoom dengan scroll mouse
                         )
                     )
                 ])
@@ -313,37 +458,53 @@ def layout_peta():
 # HALAMAN 3: ANALISIS KLUSTER
 # ═════════════════════════════════════════════
 def layout_kluster():
+    """
+    Membangun layout halaman Analisis Kluster DBSCAN dengan:
+    - Slider ε (epsilon) dalam km: jarak radius pencarian tetangga
+    - Slider min_samples: minimum titik untuk membentuk kluster inti
+    - Tombol 'Jalankan' yang memicu callback DBSCAN secara eksplisit
+    - Peta hasil kluster, metrik evaluasi, bar chart, dan scatter plot
+
+    Penggunaan dcc.Loading membuat spinner muncul selama komputasi DBSCAN
+    (yang dapat memakan waktu beberapa detik pada dataset besar).
+    """
     return dbc.Container([
         html.H4("🔵 Analisis Kluster DBSCAN",
                 className="my-3 fw-bold text-dark"),
 
-        # ── Panel Kontrol Parameter ────────────────────────
+        # ── Panel Kontrol Parameter DBSCAN ─────────────────────────────────
         dbc.Card([
             dbc.CardHeader("⚙️ Parameter DBSCAN (Real-time)"),
             dbc.CardBody([
                 dbc.Row([
                     dbc.Col([
                         html.Label("ε / Epsilon (km):", className="fw-semibold small"),
+                        # eps: menentukan seberapa dekat titik harus berada agar
+                        # dianggap bertetangga — makin besar → kluster makin luas
                         dcc.Slider(
                             id="kluster-eps",
                             min=50, max=300, step=25,
-                            value=200,
+                            value=200,   # nilai default dari tuning skripsi
                             marks={v: f"{v}km" for v in range(50, 301, 50)},
                             tooltip={"placement": "bottom"}
                         )
                     ], md=6),
                     dbc.Col([
                         html.Label("min_samples:", className="fw-semibold small"),
+                        # min_samples: makin besar → lebih selektif, lebih banyak noise
                         dcc.Slider(
                             id="kluster-min-samples",
                             min=100, max=3000, step=100,
-                            value=1000,
+                            value=1000,  # nilai default dari tuning skripsi
                             marks={v: str(v) for v in [100, 500, 1000, 2000, 3000]},
                             tooltip={"placement": "bottom"}
                         )
                     ], md=5),
                     dbc.Col([
                         html.Br(),
+                        # Tombol ini menjadi Input callback DBSCAN (n_clicks)
+                        # sehingga komputasi hanya berjalan saat diklik, bukan
+                        # otomatis setiap slider bergerak
                         dbc.Button(
                             "▶ Jalankan", id="btn-cluster",
                             color="primary", size="sm", className="mt-1"
@@ -353,13 +514,13 @@ def layout_kluster():
             ])
         ], className="mb-3"),
 
-        # ── Loading wrapper ────────────────────────────────
+        # ── Loading wrapper: menampilkan spinner saat DBSCAN berjalan ───────
         dcc.Loading(
             id="loading-kluster",
             type="circle",
             children=[
                 dbc.Row([
-                    # Peta Kluster
+                    # Peta hasil kluster (kiri, lebar 8 kolom)
                     dbc.Col([
                         dbc.Card([
                             dbc.CardHeader("🗺️ Peta Zona Kluster DBSCAN"),
@@ -370,7 +531,7 @@ def layout_kluster():
                         ])
                     ], md=8),
 
-                    # Metrik Evaluasi
+                    # Metrik evaluasi + bar chart (kanan, lebar 4 kolom)
                     dbc.Col([
                         dbc.Card([
                             dbc.CardHeader("📊 Metrik Evaluasi"),
@@ -386,6 +547,7 @@ def layout_kluster():
                     ], md=4),
                 ], className="mb-3"),
 
+                # Scatter plot magnitudo vs kedalaman (full width)
                 dbc.Row([
                     dbc.Col([
                         dbc.Card([
@@ -410,6 +572,14 @@ def layout_kluster():
 # ═════════════════════════════════════════════
 @app.callback(Output("page-content", "children"), Input("url", "pathname"))
 def routing(pathname):
+    """
+    Callback navigasi multi-halaman.
+    Setiap kali URL berubah, fungsi ini dipanggil dan mengembalikan
+    layout halaman yang sesuai ke slot 'page-content'.
+    /       → Ikhtisar
+    /peta   → Peta Interaktif
+    /kluster → Analisis Kluster
+    """
     if pathname == "/peta":
         return layout_peta()
     elif pathname == "/kluster":
@@ -421,18 +591,31 @@ def routing(pathname):
 # CALLBACKS — HALAMAN 1: IKHTISAR
 # ═════════════════════════════════════════════
 @app.callback(
-    Output("chart-tren",      "figure"),
-    Output("chart-pie",       "figure"),
-    Output("tabel-provinsi",  "children"),
-    Input("slider-tahun",     "value")
+    Output("chart-tren",      "figure"),   # grafik tren tahunan
+    Output("chart-pie",       "figure"),   # pie chart magnitudo
+    Output("tabel-provinsi",  "children"), # tabel 5 provinsi teratas
+    Input("slider-tahun",     "value")     # dipicu setiap slider bergerak
 )
 def update_ikhtisar(tahun_range):
+    """
+    Callback reaktif Halaman Ikhtisar.
+    Input: tahun_range = [tahun_awal, tahun_akhir] dari RangeSlider.
+    Setiap perubahan slider memfilter df_gempa dan memperbarui ketiga output.
+    """
+    # ┌─────────────────────────────────────────────────────────────┐
+    # │  HALAMAN 1: IKHTISAR — Sumber Tabel                        │
+    # │  KPI Cards   : FACT_GEMPA + DIM_LOKASI + DIM_KEDALAMAN     │
+    # │  Tren Tahunan: FACT_GEMPA + DIM_WAKTU                      │
+    # │  Pie Chart   : FACT_GEMPA + DIM_MAGNITUDE                  │
+    # │  Tabel Prov  : FACT_GEMPA + DIM_LOKASI                     │
+    # └─────────────────────────────────────────────────────────────┘
+    # Filter baris berdasarkan rentang tahun yang dipilih
     df = df_gempa[
         (df_gempa["tahun"] >= tahun_range[0]) &
         (df_gempa["tahun"] <= tahun_range[1])
     ]
 
-    # Tren tahunan
+    # ── Tren tahunan: hitung jumlah kejadian per tahun ───────────────────
     tren = df.groupby("tahun").size().reset_index(name="jumlah")
     fig_tren = px.bar(
         tren, x="tahun", y="jumlah",
@@ -444,9 +627,10 @@ def update_ikhtisar(tahun_range):
         plot_bgcolor="white", paper_bgcolor="white"
     )
 
-    # Pie chart magnitudo
+    # ── Pie chart magnitudo: proporsi setiap kategori ────────────────────
     mag_dist = df["kategori_magnitude"].value_counts().reset_index()
     mag_dist.columns = ["kategori", "jumlah"]
+    # Urutkan sesuai skala kekuatan gempa (dari terkecil ke terbesar)
     urutan = ["Mikro","Minor","Ringan","Sedang","Kuat","Besar","Sangat Besar"]
     mag_dist["urutan"] = mag_dist["kategori"].map(
         {k: i for i, k in enumerate(urutan)}
@@ -455,7 +639,7 @@ def update_ikhtisar(tahun_range):
     fig_pie = px.pie(
         mag_dist, names="kategori", values="jumlah",
         color_discrete_sequence=px.colors.qualitative.Set2,
-        hole=0.4
+        hole=0.4   # hole=0.4 membuat donut chart (bukan pie penuh)
     )
     fig_pie.update_layout(
         margin=dict(l=5, r=5, t=5, b=5),
@@ -463,7 +647,7 @@ def update_ikhtisar(tahun_range):
         paper_bgcolor="white"
     )
 
-    # Tabel provinsi
+    # ── Tabel 5 provinsi: value_counts lalu ambil 5 teratas ──────────────
     prov = df["provinsi"].value_counts().head(5).reset_index()
     prov.columns = ["Provinsi", "Jumlah Gempa"]
     prov["Proporsi (%)"] = (prov["Jumlah Gempa"] / len(df) * 100).round(2)
@@ -478,16 +662,32 @@ def update_ikhtisar(tahun_range):
 # CALLBACKS — HALAMAN 2: PETA INTERAKTIF
 # ═════════════════════════════════════════════
 @app.callback(
-    Output("peta-map",  "figure"),
-    Output("peta-info", "children"),
+    Output("peta-map",  "figure"),   # objek peta Mapbox
+    Output("peta-info", "children"), # teks info jumlah titik
     Input("peta-slider-tahun", "value"),
     Input("peta-filter-mag",   "value"),
     Input("peta-filter-ked",   "value"),
     Input("peta-layer",        "value"),
 )
 def update_peta(tahun_range, filter_mag, filter_ked, layers):
+    """
+    Callback reaktif Halaman Peta.
+    Dipicu oleh perubahan salah satu dari empat filter.
+    Menggabungkan hingga tiga layer pada satu objek go.Figure:
+      1. KDE Densitas (Densitymapbox) — heatmap intensitas
+      2. Episenter (Scattermapbox per grup kedalaman) — titik berlapis
+      3. Patahan Aktif (Scattermapbox mode="lines") — garis patahan
+    """
+    # ┌─────────────────────────────────────────────────────────────┐
+    # │  HALAMAN 2: PETA INTERAKTIF — Sumber Tabel                 │
+    # │  Episenter   : FACT_GEMPA + DIM_LOKASI + DIM_KEDALAMAN     │
+    # │  Hover popup : FACT_GEMPA + DIM_WAKTU + DIM_LOKASI         │
+    # │  KDE Heatmap : FACT_GEMPA + DIM_LOKASI                     │
+    # │  Patahan Aktif: GeoJSON PSG/ESDM (bukan dari PostgreSQL)   │
+    # └─────────────────────────────────────────────────────────────┘
     layers = layers or []
 
+    # Terapkan semua filter sekaligus menggunakan boolean indexing Pandas
     df = df_gempa[
         (df_gempa["tahun"] >= tahun_range[0]) &
         (df_gempa["tahun"] <= tahun_range[1]) &
@@ -495,24 +695,41 @@ def update_peta(tahun_range, filter_mag, filter_ked, layers):
         (df_gempa["kategori_kedalaman"].isin(filter_ked or []))
     ]
 
-    # Sampling maks 10k titik untuk performa
+    # Sampling maks 10.000 titik untuk performa render peta di browser
     if len(df) > 10000:
         df = df.sample(10000, random_state=42)
 
     fig = go.Figure()
 
-    # Layer KDE (heatmap densitas)
+    # ── Layer 1: KDE (Kernel Density Estimation / Heatmap Densitas) ──────
+    # Menampilkan konsentrasi episenter sebagai gradasi warna merah
     if "kde" in layers and len(df) > 0:
         fig.add_trace(go.Densitymapbox(
             lat=df["lat"], lon=df["lon"],
-            z=df["nilai_magnitude"],
+            z=df["nilai_magnitude"],   # intensitas warna berdasarkan magnitudo
             radius=15, opacity=0.6,
             colorscale="Reds",
             name="KDE Densitas",
-            showscale=False
+            showscale=True,
+            colorbar=dict(
+                orientation="h",
+                title=dict(text="Densitas Magnitudo", side="top", font=dict(size=11)),
+                thickness=12,
+                len=0.25,
+                x=0.03,
+                xanchor="left",
+                y=0.03,
+                yanchor="bottom",
+                bgcolor="rgba(255,255,255,0.85)",
+                bordercolor="gray",
+                borderwidth=1,
+                tickfont=dict(size=10),
+            )
         ))
 
-    # Layer Episenter
+    # ── Layer 2: Episenter — diplot per grup kedalaman ───────────────────
+    # Setiap grup (Dangkal/Menengah/Dalam) menjadi trace terpisah
+    # sehingga muncul di legenda dan bisa dimatikan secara individual
     if "episenter" in layers and len(df) > 0:
         warna_ked = {"Dangkal": "#E69F00", "Menengah": "#56B4E9", "Dalam": "#009E73"}
         for ked, grp in df.groupby("kategori_kedalaman"):
@@ -520,6 +737,7 @@ def update_peta(tahun_range, filter_mag, filter_ked, layers):
                 lat=grp["lat"], lon=grp["lon"],
                 mode="markers",
                 marker=dict(
+                    # Ukuran marker proporsional dengan magnitudo (clip 2–9)
                     size=grp["nilai_magnitude"].clip(2, 9) * 1.5,
                     color=warna_ked.get(ked, "gray"),
                     opacity=0.7
@@ -527,6 +745,7 @@ def update_peta(tahun_range, filter_mag, filter_ked, layers):
                 name=f"Kedalaman: {ked}",
                 customdata=grp[["tgl","ot","nilai_magnitude",
                                 "nilai_kedalaman","remark"]].values,
+                # hovertemplate: format tooltip saat kursor hover di titik
                 hovertemplate=(
                     "<b>%{customdata[4]}</b><br>"
                     "Tanggal: %{customdata[0]} %{customdata[1]}<br>"
@@ -536,7 +755,7 @@ def update_peta(tahun_range, filter_mag, filter_ked, layers):
                 )
             ))
 
-    # Layer Patahan Aktif
+    # ── Layer 3: Patahan Aktif — iterasi setiap fitur GeoJSON ────────────
     if "patahan" in layers:
         lats_all, lons_all, names_all = [], [], []
 
@@ -546,16 +765,17 @@ def update_peta(tahun_range, filter_mag, filter_ked, layers):
                 continue
             nama = str(row.get("namobj", "Patahan Aktif"))
 
-            # Support LineString dan MultiLineString
+            # Konversi geometri ke daftar koordinat (lat/lon terpisah)
+            # Plotly memerlukan None sebagai pemisah antar segmen garis
             if geom.geom_type == "LineString":
                 segmen_list = [list(geom.coords)]
             elif geom.geom_type == "MultiLineString":
                 segmen_list = [list(seg.coords) for seg in geom.geoms]
             else:
-                continue
+                continue  # lewati tipe geometri lain (Point, Polygon, dst.)
 
             for segmen in segmen_list:
-                lats_all  += [c[1] for c in segmen] + [None]
+                lats_all  += [c[1] for c in segmen] + [None]   # None = angkat pena
                 lons_all  += [c[0] for c in segmen] + [None]
                 names_all += [nama] * len(segmen)   + [None]
 
@@ -572,6 +792,7 @@ def update_peta(tahun_range, filter_mag, filter_ked, layers):
                 opacity=0.8
             ))
 
+    # Pengaturan tampilan peta: pusat Indonesia, zoom level 4
     fig.update_layout(
         mapbox=dict(style=MAPBOX_STYLE, center=dict(lat=-2.5, lon=118), zoom=4),
         margin=dict(l=0, r=0, t=0, b=0),
@@ -591,60 +812,92 @@ def update_peta(tahun_range, filter_mag, filter_ked, layers):
 # CALLBACKS — HALAMAN 3: ANALISIS KLUSTER
 # ═════════════════════════════════════════════
 @app.callback(
-    Output("kluster-map",     "figure"),
-    Output("kluster-metrik",  "children"),
-    Output("kluster-bar",     "figure"),
-    Output("kluster-scatter", "figure"),
-    Input("btn-cluster",      "n_clicks"),
-    State("kluster-eps",          "value"),
-    State("kluster-min-samples",  "value"),
-    prevent_initial_call=False
+    Output("kluster-map",     "figure"),   # peta sebaran kluster
+    Output("kluster-metrik",  "children"), # kartu metrik evaluasi
+    Output("kluster-bar",     "figure"),   # bar chart jumlah per kluster
+    Output("kluster-scatter", "figure"),   # scatter magnitudo vs kedalaman
+    Input("btn-cluster",      "n_clicks"), # tombol 'Jalankan' sebagai trigger
+    State("kluster-eps",          "value"),          # nilai ε (km)
+    State("kluster-min-samples",  "value"),          # nilai min_samples
+    prevent_initial_call=False   # tetap jalankan saat halaman pertama dibuka
 )
 def update_kluster(n_clicks, eps_km, min_samp):
+    """
+    Callback utama Halaman Analisis Kluster.
+    Alur komputasi:
+      1. Konversi koordinat WGS84 → UTM Zone 50S (EPSG:32750) dalam meter
+         agar jarak Euclidean setara dengan jarak geografis sesungguhnya
+      2. Jalankan DBSCAN dengan parameter dari slider
+      3. Hitung metrik: Silhouette Score & Davies-Bouldin Index pada sampel 10k
+      4. Buat empat visualisasi output
+
+    Catatan EPSG:32750 — UTM Zone 50S dipilih karena mencakup sebagian besar
+    kepulauan Indonesia (95°E–105°E), meminimalkan distorsi proyeksi.
+    """
+    # ┌─────────────────────────────────────────────────────────────┐
+    # │  HALAMAN 3: ANALISIS KLUSTER — Sumber Tabel                │
+    # │  Peta Kluster : FACT_GEMPA + DIM_LOKASI + DIM_KLUSTER      │
+    # │  Metrik Eval  : Dihitung real-time dari FACT_GEMPA +        │
+    # │                 DIM_LOKASI (proyeksi EPSG:32750)            │
+    # │  Bar Chart    : FACT_GEMPA + DIM_KLUSTER                   │
+    # │  Scatter Plot : FACT_GEMPA + DIM_MAGNITUDE + DIM_KEDALAMAN │
+    # │                 + DIM_KLUSTER                               │
+    # └─────────────────────────────────────────────────────────────┘
+    # Konversi epsilon dari km ke meter (satuan DBSCAN)
     eps_m = (eps_km or 200) * 1000
 
-    # Proyeksi ke meter untuk DBSCAN
+    # ── Langkah 1: Proyeksi koordinat ke sistem metrik ──────────────────
     import geopandas as gpd
     gdf_pts = gpd.GeoDataFrame(
         df_gempa[["lat","lon"]].copy(),
         geometry=gpd.points_from_xy(df_gempa["lon"], df_gempa["lat"]),
-        crs="EPSG:4326"
-    ).to_crs("EPSG:32750")
+        crs="EPSG:4326"        # koordinat geografis derajat (WGS84)
+    ).to_crs("EPSG:32750")     # proyeksikan ke meter (UTM zona Indonesia)
 
+    # X adalah matriks (N × 2) koordinat dalam meter yang menjadi input DBSCAN
     X = np.column_stack([gdf_pts.geometry.x, gdf_pts.geometry.y])
 
-    # Jalankan DBSCAN
+    # ── Langkah 2: Jalankan DBSCAN ──────────────────────────────────────
+    # algorithm="ball_tree": struktur data pohon bola — efisien untuk data spasial
+    # n_jobs=-1: gunakan semua core CPU secara paralel
     db     = DBSCAN(eps=eps_m, min_samples=min_samp or 1000,
                     algorithm="ball_tree", n_jobs=-1)
-    labels = db.fit_predict(X)
+    labels = db.fit_predict(X)  # label -1 berarti noise (tidak masuk kluster mana pun)
 
-    n_kluster = len(set(labels)) - (1 if -1 in labels else 0)
+    # Hitung statistik dasar hasil kluster
+    n_kluster = len(set(labels)) - (1 if -1 in labels else 0)  # kecualikan noise
     n_noise   = int(np.sum(labels == -1))
     pct_noise = n_noise / len(labels) * 100
 
-    # Hitung metrik pada sampel
+    # ── Langkah 3: Hitung metrik evaluasi pada sampel acak 10k ──────────
+    # Metrik dihitung pada sampel agar tidak kehabisan memori/waktu
     np.random.seed(42)
     idx_eval = np.random.choice(len(X), min(10000, len(X)), replace=False)
     if len(set(labels[idx_eval])) >= 2:
+        # Silhouette Score: -1 (buruk) → 1 (sempurna), target ≥ 0.40
         sil = silhouette_score(X[idx_eval], labels[idx_eval])
+        # Davies-Bouldin Index: makin kecil makin baik, target ≤ 3.0
         dbi = davies_bouldin_score(X[idx_eval], labels[idx_eval])
     else:
-        sil, dbi = 0.0, 0.0
+        sil, dbi = 0.0, 0.0   # hanya 1 kluster → metrik tidak bermakna
 
+    # Tambahkan kolom label ke salinan dataframe untuk keperluan visualisasi
     df_plot = df_gempa.copy()
     df_plot["label"] = labels
     df_plot["kluster_str"] = df_plot["label"].apply(
         lambda x: "Noise" if x == -1 else f"Kluster {x}"
     )
 
-    # ── Peta Kluster ──────────────────────────────
+    # ── Langkah 4a: Peta Kluster ─────────────────────────────────────────
+    # Buat pemetaan warna: setiap kluster mendapat warna dari WARNA_KLUSTER,
+    # noise selalu abu-abu
     warna_map = {}
     unik = sorted([l for l in df_plot["label"].unique() if l >= 0])
     for i, l in enumerate(unik):
         warna_map[f"Kluster {l}"] = WARNA_KLUSTER[i % len(WARNA_KLUSTER)]
     warna_map["Noise"] = "#cccccc"
 
-    # Sampel untuk performa peta
+    # Sampel untuk performa peta — seluruh data terlalu berat untuk browser
     df_sample = df_plot.sample(min(10000, len(df_plot)), random_state=42)
     fig_map = px.scatter_mapbox(
         df_sample,
@@ -664,9 +917,10 @@ def update_kluster(n_clicks, eps_km, min_samp):
         legend=dict(font=dict(size=11))
     )
 
-    # ── Kartu Metrik ──────────────────────────────
-    target_sil = sil >= 0.40
-    target_dbi = dbi <= 3.0
+    # ── Langkah 4b: Kartu Metrik Evaluasi ───────────────────────────────
+    # Indikator ✅/⚠️ ditentukan berdasarkan ambang batas dari literatur
+    target_sil = sil >= 0.40   # silhouette ≥ 0.40 → pemisahan kluster baik
+    target_dbi = dbi <= 3.0    # DBI ≤ 3.0 → kluster kompak & terpisah baik
 
     metrik = dbc.ListGroup([
         dbc.ListGroupItem([
@@ -704,7 +958,7 @@ def update_kluster(n_clicks, eps_km, min_samp):
         ]),
     ], flush=True, className="small")
 
-    # ── Bar Chart per Kluster ──────────────────────
+    # ── Langkah 4c: Bar Chart jumlah gempa per kluster (tanpa noise) ─────
     cnt = df_plot[df_plot["label"] >= 0]["kluster_str"].value_counts().reset_index()
     cnt.columns = ["Kluster", "Jumlah"]
     fig_bar = px.bar(
@@ -719,7 +973,9 @@ def update_kluster(n_clicks, eps_km, min_samp):
         plot_bgcolor="white", paper_bgcolor="white"
     )
 
-    # ── Scatter Mag vs Depth ───────────────────────
+    # ── Langkah 4d: Scatter Plot Magnitudo vs Kedalaman ──────────────────
+    # autorange="reversed" pada sumbu Y agar kedalaman 0 km di atas
+    # (konvensi geologi: semakin dalam → semakin ke bawah di grafik)
     df_scatter = df_plot[df_plot["label"] >= 0].sample(
         min(5000, len(df_plot)), random_state=42
     )
@@ -735,7 +991,7 @@ def update_kluster(n_clicks, eps_km, min_samp):
             "kluster_str": "Kluster"
         }
     )
-    fig_scatter.update_yaxes(autorange="reversed")
+    fig_scatter.update_yaxes(autorange="reversed")  # kedalaman tumbuh ke bawah
     fig_scatter.update_layout(
         margin=dict(l=10, r=10, t=10, b=10),
         plot_bgcolor="white", paper_bgcolor="white",
@@ -749,6 +1005,10 @@ def update_kluster(n_clicks, eps_km, min_samp):
 # JALANKAN SERVER
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
+    # Blok ini hanya berjalan ketika file dieksekusi langsung (bukan di-import).
+    # debug=False: matikan debug mode untuk tampilan yang bersih saat demo.
+    # host="0.0.0.0": dengarkan semua interface (aksesibel dari jaringan lokal).
+    # port=8050: port default Dash.
     print("\n" + "="*55)
     print("  Dashboard Visual Analytics Seismisitas Indonesia")
     print("  Sri Bintang Pratomo (825220070) — UNTAR Prodi SI")
