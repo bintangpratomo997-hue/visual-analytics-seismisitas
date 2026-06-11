@@ -22,7 +22,6 @@ import geopandas as gpd   # Pandas versi geospasial — membaca shapefile/GeoJSO
 import numpy as np
 import json
 # psycopg2 / SQLAlchemy: driver & ORM untuk koneksi ke PostgreSQL
-import psycopg2
 from sqlalchemy import create_engine
 
 # Dash: framework web interaktif berbasis Python (tidak perlu menulis JS)
