@@ -15,13 +15,14 @@ Dependensi:
 # ─────────────────────────────────────────────
 # IMPOR LIBRARY
 # ─────────────────────────────────────────────
-import os  # untuk membaca environment variable (DATABASE_URL di Render)
 # Pandas & NumPy: manipulasi dan komputasi data tabular
 import pandas as pd
 import geopandas as gpd   # Pandas versi geospasial — membaca shapefile/GeoJSON
 import numpy as np
 import json
+import os   # Membaca environment variable (DATABASE_URL, PORT) saat deploy
 # psycopg2 / SQLAlchemy: driver & ORM untuk koneksi ke PostgreSQL
+import psycopg2
 from sqlalchemy import create_engine
 
 # Dash: framework web interaktif berbasis Python (tidak perlu menulis JS)
@@ -38,13 +39,9 @@ from sklearn.metrics import silhouette_score, davies_bouldin_score
 # ─────────────────────────────────────────────
 # KONFIGURASI
 # ─────────────────────────────────────────────
-# Deteksi environment:
-#   - Render/cloud → gunakan DATABASE_URL environment variable (lebih prioritas)
-#   - Lokal        → gunakan DB_CONFIG atau CSV jika DB tidak tersedia
-DATABASE_URL = os.environ.get("DATABASE_URL")
-
-# Kredensial koneksi database PostgreSQL lokal
-# (hanya digunakan jika DATABASE_URL tidak diset)
+# Kredensial koneksi database PostgreSQL untuk pengembangan LOKAL.
+# Saat deploy (mis. Railway), nilai ini DIABAIKAN — koneksi memakai
+# environment variable DATABASE_URL yang otomatis disediakan platform.
 DB_CONFIG = {
     "host"    : "localhost",
     "port"    : 5432,
@@ -54,8 +51,6 @@ DB_CONFIG = {
 }
 # Path file GeoJSON patahan aktif dari Geoportal ESDM
 GEOJSON_PATH = "Patahan Aktif geoportal.esdm.go.id.geojson"
-# Path CSV dataset gempa (fallback jika tidak ada koneksi DB)
-CSV_PATH = "bmkg_gempa_indonesia_Ja2000_Fe2026.csv"
 # Gaya peta dasar — open-street-map tidak memerlukan token API
 MAPBOX_STYLE = "open-street-map"
 
@@ -77,15 +72,29 @@ WARNA_KLUSTER = [
 def get_engine():
     """
     Membuat SQLAlchemy engine untuk koneksi ke PostgreSQL.
-    Urutan prioritas:
-      1. DATABASE_URL environment variable → digunakan di Render/cloud
-      2. DB_CONFIG lokal → digunakan saat development di localhost
+    Engine ini digunakan oleh pandas.read_sql() untuk menarik data
+    dari data warehouse tanpa menulis query koneksi secara manual.
+
+    Prioritas koneksi:
+      1. Jika ada environment variable DATABASE_URL (kondisi deploy, mis.
+         Railway/Heroku) → pakai URL tersebut.
+      2. Jika tidak ada (pengembangan lokal) → pakai DB_CONFIG di atas.
     """
-    if DATABASE_URL:
-        # Render menyediakan URL dalam format postgresql://, SQLAlchemy 2.x
-        # memerlukan postgresql+psycopg2://
-        url = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
-        return create_engine(url)
+    database_url = os.environ.get("DATABASE_URL")
+
+    if database_url:
+        # Railway memberi URL berformat "postgresql://..." atau "postgres://...".
+        # SQLAlchemy + psycopg2 mengharuskan prefix "postgresql+psycopg2://",
+        # jadi kita normalisasi terlebih dahulu.
+        if database_url.startswith("postgres://"):
+            database_url = database_url.replace("postgres://", "postgresql://", 1)
+        if database_url.startswith("postgresql://"):
+            database_url = database_url.replace(
+                "postgresql://", "postgresql+psycopg2://", 1
+            )
+        return create_engine(database_url)
+
+    # ── Fallback: koneksi lokal memakai DB_CONFIG ──
     cfg = DB_CONFIG
     return create_engine(
         f"postgresql+psycopg2://{cfg['user']}:{cfg['password']}"
@@ -97,87 +106,53 @@ def get_engine():
 # ─────────────────────────────────────────────
 # Data dimuat sekali saat aplikasi pertama dijalankan dan disimpan di RAM.
 # Pendekatan ini menghindari query berulang ke database setiap ada interaksi.
+print("Memuat data dari PostgreSQL...")
+engine = get_engine()
 
-def _load_from_csv():
-    """
-    Fallback: baca dataset langsung dari file CSV (tanpa PostgreSQL).
-    Kolom di CSV menggunakan nama asli BMKG ('mag', 'depth'), sedangkan
-    kode callback mengharapkan nama dari star schema ('nilai_magnitude',
-    'nilai_kedalaman'). Fungsi ini menangani pemetaan tersebut dan
-    menambahkan kolom placeholder untuk kolom yang tidak ada di CSV.
-    """
-    print("  [CSV] Memuat dari file CSV...")
-    df = pd.read_csv(CSV_PATH)
-    # Normalisasi nama kolom agar sesuai dengan yang diharapkan callback
-    df = df.rename(columns={
-        "mag"  : "nilai_magnitude",
-        "depth": "nilai_kedalaman"
-    })
-    # Kolom dari star schema yang tidak ada di CSV → diisi nilai default
-    df["jarak_patahan_km"] = np.nan
-    df["dekat_patahan"]    = False
-    df["id_kluster"]       = None
-    df["label_kluster"]    = None
-    df["id_fakta"]         = range(len(df))
-    return df
+# ┌─────────────────────────────────────────────────────────────┐
+# │  SUMBER DATA UTAMA — Star Schema Join                       │
+# │  Tabel: FACT_GEMPA (tabel pusat)                            │
+# │    JOIN  DIM_WAKTU      → tgl, ot, tahun, bulan             │
+# │    JOIN  DIM_LOKASI     → lat, lon, provinsi, remark        │
+# │    JOIN  DIM_MAGNITUDE  → kategori_magnitude                │
+# │    JOIN  DIM_KEDALAMAN  → kategori_kedalaman                │
+# │    LEFT JOIN DIM_KLUSTER → label_kluster (nullable)         │
+# │  Sumber GeoJSON: PSG/Badan Geologi ESDM (patahan aktif)     │
+# └─────────────────────────────────────────────────────────────┘
+# Query JOIN star-schema: menggabungkan fact_gempa dengan semua tabel dimensi.
+# Arsitektur data warehouse bintang ini memisahkan fakta (nilai numerik)
+# dari dimensi (atribut deskriptif) agar query analitik lebih efisien.
+df_gempa = pd.read_sql("""
+    SELECT
+        f.id_fakta,
+        w.tgl, w.ot, w.tahun, w.bulan,
+        l.lat, l.lon, l.provinsi, l.remark,
+        f.nilai_magnitude, f.nilai_kedalaman,
+        f.jarak_patahan_km, f.dekat_patahan,
+        m.kategori_magnitude,
+        k.kategori_kedalaman,
+        f.id_kluster,
+        kl.label_kluster
+    FROM fact_gempa f
+    JOIN dim_waktu     w  ON f.id_waktu    = w.id_waktu
+    JOIN dim_lokasi    l  ON f.id_lokasi   = l.id_lokasi
+    JOIN dim_magnitude m  ON f.id_magnitude = m.id_magnitude
+    JOIN dim_kedalaman k  ON f.id_kedalaman = k.id_kedalaman
+    LEFT JOIN dim_kluster kl ON f.id_kluster = kl.id_kluster
+""", engine)
 
-# ── Inisialisasi: coba PostgreSQL dulu, fallback ke CSV ─────────────────────
-print("Memuat data...")
-df_gempa   = None
-df_kluster = pd.DataFrame(columns=["id_kluster", "label_kluster"])
-
-if DATABASE_URL:
-    # Mode cloud (Render): DATABASE_URL diset sebagai env var
-    try:
-        engine   = get_engine()
-        # ┌─────────────────────────────────────────────────────────────┐
-        # │  SUMBER DATA UTAMA — Star Schema Join                       │
-        # │  Tabel: FACT_GEMPA (tabel pusat)                            │
-        # │    JOIN  DIM_WAKTU      → tgl, ot, tahun, bulan             │
-        # │    JOIN  DIM_LOKASI     → lat, lon, provinsi, remark        │
-        # │    JOIN  DIM_MAGNITUDE  → kategori_magnitude                │
-        # │    JOIN  DIM_KEDALAMAN  → kategori_kedalaman                │
-        # │    LEFT JOIN DIM_KLUSTER → label_kluster (nullable)         │
-        # │  Sumber GeoJSON: PSG/Badan Geologi ESDM (patahan aktif)     │
-        # └─────────────────────────────────────────────────────────────┘
-        df_gempa = pd.read_sql("""
-            SELECT
-                f.id_fakta,
-                w.tgl, w.ot, w.tahun, w.bulan,
-                l.lat, l.lon, l.provinsi, l.remark,
-                f.nilai_magnitude, f.nilai_kedalaman,
-                f.jarak_patahan_km, f.dekat_patahan,
-                m.kategori_magnitude,
-                k.kategori_kedalaman,
-                f.id_kluster,
-                kl.label_kluster
-            FROM fact_gempa f
-            JOIN dim_waktu     w  ON f.id_waktu    = w.id_waktu
-            JOIN dim_lokasi    l  ON f.id_lokasi   = l.id_lokasi
-            JOIN dim_magnitude m  ON f.id_magnitude = m.id_magnitude
-            JOIN dim_kedalaman k  ON f.id_kedalaman = k.id_kedalaman
-            LEFT JOIN dim_kluster kl ON f.id_kluster = kl.id_kluster
-        """, engine)
-        df_kluster = pd.read_sql(
-            "SELECT * FROM dim_kluster ORDER BY id_kluster", engine
-        )
-        print(f"  [DB] Data gempa  : {len(df_gempa):,} baris")
-        print(f"  [DB] Kluster     : {len(df_kluster)} kluster")
-    except Exception as e:
-        print(f"  [WARN] Koneksi DB gagal: {e}")
-        df_gempa = None
-
-if df_gempa is None:
-    # Mode lokal atau fallback: muat dari CSV
-    df_gempa = _load_from_csv()
-    print(f"  [CSV] Data gempa : {len(df_gempa):,} baris")
+# Memuat dimensi kluster yang sudah tersimpan di database (hasil DBSCAN final)
+df_kluster = pd.read_sql(
+    "SELECT * FROM dim_kluster ORDER BY id_kluster", engine
+)
 
 # Membaca GeoJSON patahan aktif, lalu filter hanya segmen berkelas "Aktif"
 gdf_patahan = gpd.read_file(GEOJSON_PATH)
 gdf_aktif   = gdf_patahan[gdf_patahan["klspthn"] == "Aktif"].copy()
 
+print(f"  Data gempa   : {len(df_gempa):,} baris")
+print(f"  Kluster      : {len(df_kluster)} kluster")
 print(f"  Patahan aktif: {len(gdf_aktif)} segmen")
-print("Data siap.\n")
 
 # ─────────────────────────────────────────────
 # INISIALISASI APP
@@ -308,7 +283,10 @@ def layout_ikhtisar():
                     id="slider-tahun",
                     min=tahun_min, max=tahun_max,
                     value=[tahun_min, tahun_max],
-                    marks={y: str(y) for y in range(tahun_min, tahun_max+1, 5)},
+                    marks={
+                        y: {"label": str(y), "style": {"fontSize": "11px"}}
+                        for y in range(tahun_min, tahun_max + 1, 5)
+                    },
                     tooltip={"placement": "bottom", "always_visible": False}
                 )
             ])
@@ -392,12 +370,23 @@ def layout_peta():
                     dbc.CardHeader("⚙️ Filter Data"),
                     dbc.CardBody([
                         html.Label("Rentang Tahun:", className="fw-semibold small"),
-                        # Default ditampilkan: 5 tahun terakhir
+                        # Default ditampilkan: seluruh rentang tahun
                         dcc.RangeSlider(
                             id="peta-slider-tahun",
                             min=tahun_min, max=tahun_max,
-                            value=[2015, tahun_max],
-                            marks={y: str(y) for y in range(tahun_min, tahun_max+1, 5)},
+                            # Default: tampilkan seluruh rentang tahun yang tersedia
+                            value=[tahun_min, tahun_max],
+                            # Panel samping sempit → label tiap 10 tahun + titik
+                            # ujung (tahun_max) agar tidak saling menimpa.
+                            marks={
+                                **{
+                                    y: {"label": str(y),
+                                        "style": {"fontSize": "10px"}}
+                                    for y in range(tahun_min, tahun_max + 1, 10)
+                                },
+                                tahun_max: {"label": str(tahun_max),
+                                            "style": {"fontSize": "10px"}},
+                            },
                             tooltip={"placement": "bottom"}
                         ),
                         html.Hr(),
@@ -730,7 +719,10 @@ def update_peta(tahun_range, filter_mag, filter_ked, layers):
     # Setiap grup (Dangkal/Menengah/Dalam) menjadi trace terpisah
     # sehingga muncul di legenda dan bisa dimatikan secara individual
     if "episenter" in layers and len(df) > 0:
-        warna_ked = {"Dangkal": "#E69F00", "Menengah": "#56B4E9", "Dalam": "#009E73"}
+        # Palet cerah & kontras tinggi, mengikuti gradien kedalaman
+        # (dangkal = merah/panas → dalam = ungu/dingin) agar mudah dibedakan
+        # di atas peta dasar yang terang.
+        warna_ked = {"Dangkal": "#FF1744", "Menengah": "#FF9100", "Dalam": "#6200EA"}
         for ked, grp in df.groupby("kategori_kedalaman"):
             fig.add_trace(go.Scattermapbox(
                 lat=grp["lat"], lon=grp["lon"],
@@ -739,7 +731,7 @@ def update_peta(tahun_range, filter_mag, filter_ked, layers):
                     # Ukuran marker proporsional dengan magnitudo (clip 2–9)
                     size=grp["nilai_magnitude"].clip(2, 9) * 1.5,
                     color=warna_ked.get(ked, "gray"),
-                    opacity=0.7
+                    opacity=0.85
                 ),
                 name=f"Kedalaman: {ked}",
                 customdata=grp[["tgl","ot","nilai_magnitude",
@@ -818,7 +810,7 @@ def update_peta(tahun_range, filter_mag, filter_ked, layers):
     Input("btn-cluster",      "n_clicks"), # tombol 'Jalankan' sebagai trigger
     State("kluster-eps",          "value"),          # nilai ε (km)
     State("kluster-min-samples",  "value"),          # nilai min_samples
-    prevent_initial_call=True    # hanya jalankan saat tombol "Jalankan" diklik
+    prevent_initial_call=False   # tetap jalankan saat halaman pertama dibuka
 )
 def update_kluster(n_clicks, eps_km, min_samp):
     """
@@ -1015,4 +1007,6 @@ if __name__ == "__main__":
     print("  Buka browser: http://127.0.0.1:8050")
     print("  Tekan Ctrl+C untuk menghentikan server")
     print("="*55 + "\n")
-    app.run(debug=False, host="0.0.0.0", port=8050)
+    # port: pakai env var PORT bila ada (kondisi deploy), default 8050 untuk lokal.
+    port = int(os.environ.get("PORT", 8050))
+    app.run(debug=False, host="0.0.0.0", port=port)
